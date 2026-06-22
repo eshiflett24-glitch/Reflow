@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070B16">
+<title>Reflow — sketch a physics system, watch it come alive</title>
+<meta name="description" content="Draw a physical system by hand. An AI reads your sketch and turns it into a live, running simulation with the governing equations.">
+<meta property="og:title" content="Reflow — sketch to simulation">
+<meta property="og:description" content="Hand-drawn physics, read by AI, simulated live with real numerical integration.">
+<style>
+  html,body{margin:0;background:#070B16;color:#EAF1F8;font-family:system-ui,sans-serif}
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#5BD6FF;font-family:ui-monospace,monospace;font-size:13px}
+  @keyframes sp{to{transform:rotate(360deg)}} .bspin{animation:sp 1s linear infinite;width:20px;height:20px;margin-right:10px}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><div id="boot"><svg class="bspin" viewBox="0 0 24 24" fill="none" stroke="#5BD6FF" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></svg>Warming up the lab…</div></div>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ═══════════════════════════ palette / type ═══════════════════════════ */
+const C = {
+  ink: "#070B16", panel: "#0C1222", panel2: "#0A0F1D", grid: "rgba(91,214,255,0.07)",
+  gridLine: "rgba(91,214,255,0.13)", edge: "rgba(120,150,190,0.16)",
+  cyan: "#5BD6FF", cyanDim: "#2B6E86", amber: "#FFC24B", magenta: "#FF6BD6",
+  paper: "#EAF1F8", mute: "#7C8BA6", good: "#74E39B", bad: "#FF6B72",
+};
+const disp = "'Space Grotesk', system-ui, sans-serif";
+const ui = "'Inter', system-ui, sans-serif";
+const mono = "'JetBrains Mono', ui-monospace, monospace";
+const mathF = "'Newsreader', Georgia, serif";
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ═══════════════════════════ math typesetting ═══════════════════════════ */
+const V = ({ c }) => <span style={{ fontFamily: mathF, fontStyle: "italic", letterSpacing: 0.2 }}>{c}</span>;
+const Frac = ({ n, d }) => (
+  <span style={{ display: "inline-flex", flexDirection: "column", textAlign: "center", verticalAlign: "middle", margin: "0 4px", lineHeight: 1.05 }}>
+    <span style={{ borderBottom: `1px solid ${C.cyanDim}`, padding: "0 7px 2px" }}>{n}</span>
+    <span style={{ padding: "2px 7px 0" }}>{d}</span>
+  </span>
+);
+const Sup = ({ c }) => <sup style={{ fontSize: ".62em" }}>{c}</sup>;
+const EQ = ({ children }) => (
+  <div style={{ fontFamily: mathF, fontSize: 21, color: C.paper, display: "flex", alignItems: "center", flexWrap: "wrap", lineHeight: 1.7 }}>{children}</div>
+);
+
+/* ═══════════════════════════ drawing helpers ═══════════════════════════ */
+function arrow(ctx, x1, y1, x2, y2, color, label, lw = 2.5) {
+  const a = Math.atan2(y2 - y1, x2 - x1), h = 9;
+  ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.shadowColor = color; ctx.shadowBlur = 8;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - h * Math.cos(a - 0.4), y2 - h * Math.sin(a - 0.4));
+  ctx.lineTo(x2 - h * Math.cos(a + 0.4), y2 - h * Math.sin(a + 0.4)); ctx.closePath(); ctx.fill();
+  if (label) { ctx.shadowBlur = 0; ctx.font = `italic 13px ${mathF}`; ctx.fillText(label, x2 + 5 * Math.cos(a), y2 + 5 * Math.sin(a) - 4); }
+  ctx.restore();
+}
+function bg(ctx, W, H) {
+  ctx.fillStyle = C.panel2; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  const g = 26;
+  for (let x = 0; x < W; x += g) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += g) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+}
+function glowDot(ctx, x, y, r, color) {
+  ctx.save(); ctx.shadowColor = color; ctx.shadowBlur = 16; ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.restore();
+}
+function line(ctx, x1, y1, x2, y2, color, lw = 3, glow = 10) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.lineCap = "round"; ctx.shadowColor = color; ctx.shadowBlur = glow;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.restore();
+}
+function trail(ctx, pts, color) {
+  if (pts.length < 2) return;
+  ctx.save(); ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (let i = 1; i < pts.length; i++) {
+    ctx.strokeStyle = color; ctx.globalAlpha = (i / pts.length) * 0.85; ctx.lineWidth = (i / pts.length) * 2.6 + 0.4;
+    ctx.beginPath(); ctx.moveTo(pts[i - 1][0], pts[i - 1][1]); ctx.lineTo(pts[i][0], pts[i][1]); ctx.stroke();
+  }
+  ctx.restore();
+}
+const rk4 = (s, f, dt) => {
+  const add = (a, b, h) => a.map((v, i) => v + b[i] * h);
+  const k1 = f(s), k2 = f(add(s, k1, dt / 2)), k3 = f(add(s, k2, dt / 2)), k4 = f(add(s, k3, dt));
+  return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+};
+
+/* ═══════════════════════════ simulation registry ═══════════════════════════ */
+const SIM = {
+  pendulum: {
+    title: "Simple Pendulum", blurb: "A bob swinging on a rigid rod.",
+    schema: [
+      { k: "length_m", label: "Length", unit: "m", min: 0.3, max: 3, step: 0.05, def: 1.4 },
+      { k: "angle_deg", label: "Release angle", unit: "°", min: 5, max: 89, step: 1, def: 45 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+      { k: "damping", label: "Damping", unit: "", min: 0, max: 1, step: 0.02, def: 0.1 },
+    ],
+    init: (p) => ({ th: p.angle_deg * Math.PI / 180, w: 0, t: 0, trail: [] }),
+    step(s, p, dt) { const g = p.gravity, L = p.length_m, b = p.damping;
+      s.w += (-(g / L) * Math.sin(s.th) - b * s.w) * dt; s.th += s.w * dt; s.t += dt; },
+    draw(ctx, s, p, W, H) { const cx = W / 2, py = H * 0.16, L = clamp(p.length_m * 70, 60, H * 0.66);
+      const bx = cx + L * Math.sin(s.th), by = py + L * Math.cos(s.th);
+      ctx.save(); ctx.strokeStyle = C.cyanDim; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(cx, py); ctx.lineTo(cx, py + L + 14); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.strokeStyle = C.cyanDim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(cx, py, 26, Math.PI / 2, Math.PI / 2 + s.th, s.th < 0); ctx.stroke(); ctx.restore();
+      s.trail.push([bx, by]); if (s.trail.length > 70) s.trail.shift(); trail(ctx, s.trail, C.magenta);
+      line(ctx, cx, py, bx, by, C.cyan, 3, 10);
+      ctx.save(); ctx.fillStyle = C.cyan; ctx.beginPath(); ctx.arc(cx, py, 5, 0, 7); ctx.fill(); ctx.restore();
+      glowDot(ctx, bx, by, 13, C.amber); },
+    signal: (s) => ({ label: "angle θ", value: s.th * 180 / Math.PI, unit: "°" }),
+    energy(s, p) { const L = p.length_m; return { ke: 0.5 * (L * s.w) ** 2, pe: p.gravity * L * (1 - Math.cos(s.th)) }; },
+    derived: (p) => [{ k: "Period T", v: (2 * Math.PI * Math.sqrt(p.length_m / p.gravity)).toFixed(2) + " s" }, { k: "ω₀", v: Math.sqrt(p.gravity / p.length_m).toFixed(2) + " rad/s" }],
+    eq: <EQ><Frac n={<>d<Sup c="2" /><V c="θ" /></>} d={<>d<V c="t" /><Sup c="2" /></>} /> = −<Frac n={<V c="g" />} d={<V c="L" />} /> sin <V c="θ" /> − <V c="b" /><Frac n={<>d<V c="θ" /></>} d={<>d<V c="t" /></>} /></EQ>,
+  },
+
+  double_pendulum: {
+    title: "Double Pendulum", blurb: "Two coupled arms — deterministic chaos.",
+    schema: [
+      { k: "l1_m", label: "Arm 1", unit: "m", min: 0.4, max: 2, step: 0.05, def: 1.1 },
+      { k: "l2_m", label: "Arm 2", unit: "m", min: 0.4, max: 2, step: 0.05, def: 1.0 },
+      { k: "m1_kg", label: "Mass 1", unit: "kg", min: 0.5, max: 5, step: 0.1, def: 1.4 },
+      { k: "m2_kg", label: "Mass 2", unit: "kg", min: 0.5, max: 5, step: 0.1, def: 1.0 },
+      { k: "angle1_deg", label: "Angle 1", unit: "°", min: -179, max: 179, step: 1, def: 120 },
+      { k: "angle2_deg", label: "Angle 2", unit: "°", min: -179, max: 179, step: 1, def: -10 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+    ],
+    init: (p) => ({ s: [p.angle1_deg * Math.PI / 180, p.angle2_deg * Math.PI / 180, 0, 0], t: 0, trail: [] }),
+    step(st, p, dt) {
+      const { l1_m: l1, l2_m: l2, m1_kg: m1, m2_kg: m2, gravity: g } = p;
+      const f = (y) => { const [a1, a2, w1, w2] = y, d = a1 - a2, cd = Math.cos(d), sd = Math.sin(d);
+        const den1 = l1 * (2 * m1 + m2 - m2 * Math.cos(2 * a1 - 2 * a2));
+        const den2 = l2 * (2 * m1 + m2 - m2 * Math.cos(2 * a1 - 2 * a2));
+        const A1 = (-g * (2 * m1 + m2) * Math.sin(a1) - m2 * g * Math.sin(a1 - 2 * a2) - 2 * sd * m2 * (w2 * w2 * l2 + w1 * w1 * l1 * cd)) / den1;
+        const A2 = (2 * sd * (w1 * w1 * l1 * (m1 + m2) + g * (m1 + m2) * Math.cos(a1) + w2 * w2 * l2 * m2 * cd)) / den2;
+        return [w1, w2, A1, A2]; };
+      let sub = 6, h = dt / sub; for (let i = 0; i < sub; i++) st.s = rk4(st.s, f, h); st.t += dt;
+    },
+    draw(ctx, st, p, W, H) { const cx = W / 2, cy = H * 0.34, sc = clamp(Math.min(W, H) * 0.2, 50, 110);
+      const [a1, a2] = st.s; const x1 = cx + sc * p.l1_m * Math.sin(a1), y1 = cy + sc * p.l1_m * Math.cos(a1);
+      const x2 = x1 + sc * p.l2_m * Math.sin(a2), y2 = y1 + sc * p.l2_m * Math.cos(a2);
+      st.trail.push([x2, y2]); if (st.trail.length > 160) st.trail.shift(); trail(ctx, st.trail, C.magenta);
+      line(ctx, cx, cy, x1, y1, C.cyan, 3, 9); line(ctx, x1, y1, x2, y2, C.cyan, 3, 9);
+      ctx.save(); ctx.fillStyle = C.cyan; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 7); ctx.fill(); ctx.restore();
+      glowDot(ctx, x1, y1, 7 + p.m1_kg, C.amber); glowDot(ctx, x2, y2, 7 + p.m2_kg, C.amber); },
+    signal: (st) => ({ label: "angle θ₂", value: st.s[1] * 180 / Math.PI, unit: "°" }),
+    energy: null,
+    derived: () => [{ k: "Regime", v: "chaotic" }, { k: "Sensitivity", v: "exponential" }],
+    eq: <EQ style={{ fontSize: 16 }}><span style={{ fontFamily: mathF, fontStyle: "italic", fontSize: 17, color: C.mute }}>Lagrangian system — two coupled second-order ODEs, integrated by RK4.</span></EQ>,
+  },
+
+  projectile: {
+    title: "Projectile", blurb: "A body launched under gravity.",
+    schema: [
+      { k: "speed_ms", label: "Launch speed", unit: "m/s", min: 4, max: 40, step: 0.5, def: 18 },
+      { k: "angle_deg", label: "Launch angle", unit: "°", min: 5, max: 85, step: 1, def: 52 },
+      { k: "height_m", label: "Start height", unit: "m", min: 0, max: 20, step: 0.5, def: 0 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+    ],
+    init: (p) => ({ t: 0, trail: [], done: false, hold: 0 }),
+    step(s, p, dt) { if (s.done) { s.hold += dt; return; } s.t += dt;
+      const vy = p.speed_ms * Math.sin(p.angle_deg * Math.PI / 180) - p.gravity * s.t;
+      const y = p.height_m + p.speed_ms * Math.sin(p.angle_deg * Math.PI / 180) * s.t - 0.5 * p.gravity * s.t * s.t;
+      if (y <= 0 && s.t > 0.05) s.done = true; void vy; },
+    draw(ctx, s, p, W, H) { const g = p.gravity, v = p.speed_ms, th = p.angle_deg * Math.PI / 180, h0 = p.height_m;
+      const tF = (v * Math.sin(th) + Math.sqrt((v * Math.sin(th)) ** 2 + 2 * g * h0)) / g;
+      const range = v * Math.cos(th) * tF, maxH = h0 + (v * Math.sin(th)) ** 2 / (2 * g);
+      const m = 40, gy = H - 34, sx = (W - 2 * m) / Math.max(range, 1), sy = (gy - 28) / Math.max(maxH, 1), sc = Math.min(sx, sy);
+      const X = (x) => m + x * sc, Y = (y) => gy - y * sc;
+      line(ctx, 0, gy, W, gy, C.cyanDim, 2, 0);
+      ctx.save(); ctx.strokeStyle = "rgba(91,214,255,0.35)"; ctx.setLineDash([5, 5]); ctx.lineWidth = 1.5; ctx.beginPath();
+      for (let tt = 0; tt <= tF; tt += tF / 90) { const x = v * Math.cos(th) * tt, y = h0 + v * Math.sin(th) * tt - 0.5 * g * tt * tt; tt === 0 ? ctx.moveTo(X(x), Y(y)) : ctx.lineTo(X(x), Y(y)); }
+      ctx.stroke(); ctx.restore();
+      const ct = Math.min(s.t, tF), cx = v * Math.cos(th) * ct, cy = h0 + v * Math.sin(th) * ct - 0.5 * g * ct * ct;
+      const px = X(cx), py = Y(Math.max(cy, 0));
+      s.trail.push([px, py]); if (s.trail.length > 80) s.trail.shift(); trail(ctx, s.trail, C.magenta);
+      const vx = v * Math.cos(th), vyn = v * Math.sin(th) - g * ct, vm = Math.hypot(vx, vyn);
+      if (cy >= 0) arrow(ctx, px, py, px + vx / vm * 34, py - vyn / vm * 34, C.amber, "v");
+      glowDot(ctx, px, py, 11, C.amber);
+      ctx.save(); ctx.fillStyle = C.mute; ctx.font = `11px ${mono}`;
+      glowDot(ctx, X(range), gy, 4, C.cyan); ctx.fillText("range " + range.toFixed(1) + " m", X(range) - 30, gy + 18);
+      const apex = X(v * Math.cos(th) * (v * Math.sin(th) / g)); glowDot(ctx, apex, Y(maxH), 4, C.cyan); ctx.fillText("apex " + maxH.toFixed(1) + " m", apex + 8, Y(maxH)); ctx.restore(); },
+    signal: (s) => ({ label: "height y", value: Math.max(0, s._y || 0), unit: "m" }),
+    energy: null,
+    derived: (p) => { const th = p.angle_deg * Math.PI / 180, v = p.speed_ms, g = p.gravity, h0 = p.height_m;
+      const tF = (v * Math.sin(th) + Math.sqrt((v * Math.sin(th)) ** 2 + 2 * g * h0)) / g;
+      return [{ k: "Range", v: (v * Math.cos(th) * tF).toFixed(1) + " m" }, { k: "Flight time", v: tF.toFixed(2) + " s" }]; },
+    eq: <EQ><V c="y" />(<V c="t" />) = <V c="y" /><Sub c="0" /> + <V c="v" /> sin<V c="θ" />·<V c="t" /> − <Frac n="1" d="2" /><V c="g" /><V c="t" /><Sup c="2" /></EQ>,
+  },
+
+  incline: {
+    title: "Block on Incline", blurb: "Gravity, normal force, and friction on a ramp.",
+    schema: [
+      { k: "angle_deg", label: "Ramp angle", unit: "°", min: 5, max: 75, step: 1, def: 30 },
+      { k: "mass_kg", label: "Mass", unit: "kg", min: 0.5, max: 10, step: 0.5, def: 2 },
+      { k: "mu", label: "Friction μ", unit: "", min: 0, max: 1.2, step: 0.02, def: 0.25 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+    ],
+    init: (p) => ({ s: 0, v: 0, t: 0, done: false, hold: 0 }),
+    step(st, p, dt) { const th = p.angle_deg * Math.PI / 180, g = p.gravity;
+      const slides = Math.sin(th) > p.mu * Math.cos(th);
+      const a = slides ? g * (Math.sin(th) - p.mu * Math.cos(th)) : 0;
+      if (st.done) { st.hold += dt; return; }
+      st.v += a * dt; st.s += st.v * dt; st.t += dt; st._slides = slides; st._a = a;
+      if (st.s > 1.0) st.done = true; },
+    draw(ctx, st, p, W, H) { const th = p.angle_deg * Math.PI / 180;
+      const m = 46, baseY = H - 44, runW = Math.min(W - 2 * m, (baseY - 40) / Math.tan(th) || W);
+      const ax = m, ay = baseY, bx = m + runW, by = baseY, tx = m, ty = baseY - runW * Math.tan(th);
+      ctx.save(); ctx.fillStyle = "rgba(91,214,255,0.05)"; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.lineTo(tx, ty); ctx.closePath(); ctx.fill();
+      line(ctx, tx, ty, bx, by, C.cyan, 2.5, 8); line(ctx, ax, ay, bx, by, C.cyanDim, 2, 0);
+      ctx.strokeStyle = C.cyanDim; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.arc(bx, by, 30, Math.PI, Math.PI - th, true); ctx.stroke();
+      ctx.fillStyle = C.mute; ctx.font = `italic 13px ${mathF}`; ctx.fillText(p.angle_deg + "°", bx - 44, by - 8); ctx.restore();
+      const prog = clamp(st.s, 0, 1), topx = tx + (bx - tx) * 0.12, topy = ty + (by - ty) * 0.12;
+      const px = topx + (bx - topx) * prog * 0.82, py = topy + (by - topy) * prog * 0.82;
+      const ux = Math.cos(th), uy = -Math.sin(th), nx = -Math.sin(th), ny = -Math.cos(th), bs = 17;
+      ctx.save(); ctx.translate(px, py); ctx.rotate(-th); ctx.shadowColor = C.amber; ctx.shadowBlur = 12;
+      ctx.fillStyle = "rgba(255,194,75,0.9)"; ctx.strokeStyle = C.amber; ctx.lineWidth = 2; ctx.fillRect(-bs, -2 * bs, 2 * bs, 2 * bs); ctx.strokeRect(-bs, -2 * bs, 2 * bs, 2 * bs); ctx.restore();
+      const cxp = px + nx * bs, cyp = py + ny * bs;
+      arrow(ctx, cxp, cyp, cxp, cyp + 40, C.magenta, "mg");
+      arrow(ctx, cxp, cyp, cxp + nx * 34, cyp + ny * 34, C.cyan, "N");
+      if (st._slides) arrow(ctx, cxp, cyp, cxp - ux * 30, cyp - uy * 30, C.good, "f");
+      ctx.save(); ctx.font = `12px ${mono}`; ctx.fillStyle = st._slides ? C.amber : C.good;
+      ctx.fillText(st._slides ? "sliding · a = " + (st._a || 0).toFixed(2) + " m/s²" : "static · friction holds", 14, 26); ctx.restore(); },
+    signal: (s) => ({ label: "speed v", value: s.v || 0, unit: "m/s" }),
+    energy: null,
+    derived: (p) => { const th = p.angle_deg * Math.PI / 180, slides = Math.sin(th) > p.mu * Math.cos(th);
+      const a = slides ? p.gravity * (Math.sin(th) - p.mu * Math.cos(th)) : 0;
+      return [{ k: "State", v: slides ? "slides" : "static" }, { k: "Accel a", v: a.toFixed(2) + " m/s²" }]; },
+    eq: <EQ><V c="a" /> = <V c="g" />(sin<V c="θ" /> − <V c="μ" /> cos<V c="θ" />)</EQ>,
+  },
+
+  spring: {
+    title: "Mass on a Spring", blurb: "Simple harmonic motion with damping.",
+    schema: [
+      { k: "k_Nm", label: "Stiffness k", unit: "N/m", min: 2, max: 60, step: 1, def: 18 },
+      { k: "mass_kg", label: "Mass", unit: "kg", min: 0.2, max: 6, step: 0.1, def: 1.2 },
+      { k: "amplitude_m", label: "Amplitude", unit: "m", min: 0.2, max: 2, step: 0.05, def: 1.1 },
+      { k: "damping", label: "Damping", unit: "", min: 0, max: 2, step: 0.05, def: 0.25 },
+    ],
+    init: (p) => ({ x: p.amplitude_m, v: 0, t: 0 }),
+    step(s, p, dt) { s.v += (-(p.k_Nm / p.mass_kg) * s.x - p.damping * s.v) * dt; s.x += s.v * dt; s.t += dt; },
+    draw(ctx, s, p, W, H) { const cx = W / 2, top = H * 0.12, rest = H * 0.5, mx = cx, my = rest + s.x * 56;
+      line(ctx, cx - 50, top, cx + 50, top, C.cyanDim, 3, 0);
+      const coils = 12, segH = (my - top - 18) / coils;
+      ctx.save(); ctx.strokeStyle = C.cyan; ctx.lineWidth = 2.4; ctx.shadowColor = C.cyan; ctx.shadowBlur = 8; ctx.beginPath(); ctx.moveTo(cx, top);
+      for (let i = 0; i <= coils; i++) { const y = top + i * segH, x = cx + (i % 2 ? 16 : -16) * (i === 0 || i === coils ? 0 : 1); ctx.lineTo(x, y); } ctx.lineTo(cx, my - 18); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.strokeStyle = C.cyanDim; ctx.setLineDash([4, 5]); ctx.beginPath(); ctx.moveTo(cx + 70, rest); ctx.lineTo(cx + 110, rest); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.fillStyle = C.mute; ctx.font = `11px ${mono}`; ctx.fillText("x=0", cx + 78, rest - 6); ctx.restore();
+      const sz = 20 + p.mass_kg * 2; ctx.save(); ctx.shadowColor = C.amber; ctx.shadowBlur = 14; ctx.fillStyle = "rgba(255,194,75,0.92)"; ctx.strokeStyle = C.amber; ctx.lineWidth = 2;
+      ctx.fillRect(mx - sz, my - 18, 2 * sz, sz * 1.6); ctx.strokeRect(mx - sz, my - 18, 2 * sz, sz * 1.6); ctx.restore(); },
+    signal: (s) => ({ label: "displacement x", value: s.x, unit: "m" }),
+    energy: (s, p) => ({ ke: 0.5 * p.mass_kg * s.v * s.v, pe: 0.5 * p.k_Nm * s.x * s.x }),
+    derived: (p) => { const w = Math.sqrt(p.k_Nm / p.mass_kg); return [{ k: "ω", v: w.toFixed(2) + " rad/s" }, { k: "Period T", v: (2 * Math.PI / w).toFixed(2) + " s" }]; },
+    eq: <EQ><V c="m" /><Frac n={<>d<Sup c="2" /><V c="x" /></>} d={<>d<V c="t" /><Sup c="2" /></>} /> = −<V c="k" /><V c="x" /> − <V c="c" /><Frac n={<>d<V c="x" /></>} d={<>d<V c="t" /></>} /></EQ>,
+  },
+
+  atwood: {
+    title: "Atwood Machine", blurb: "Two masses over a frictionless pulley.",
+    schema: [
+      { k: "m1_kg", label: "Mass 1 (left)", unit: "kg", min: 0.5, max: 10, step: 0.5, def: 3 },
+      { k: "m2_kg", label: "Mass 2 (right)", unit: "kg", min: 0.5, max: 10, step: 0.5, def: 2 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+    ],
+    init: (p) => ({ x: 0, v: 0, t: 0 }),
+    step(s, p, dt) { const a = (p.m1_kg - p.m2_kg) / (p.m1_kg + p.m2_kg) * p.gravity;
+      s.v += a * dt; s.x += s.v * dt; s.t += dt; s._a = a;
+      const lim = 1.4; if (s.x > lim) { s.x = lim; s.v = 0; } if (s.x < -lim) { s.x = -lim; s.v = 0; } },
+    draw(ctx, s, p, W, H) { const cx = W / 2, py = H * 0.16, R = 26, lx = cx - 70, rx = cx + 70;
+      ctx.save(); ctx.strokeStyle = C.cyan; ctx.lineWidth = 3; ctx.shadowColor = C.cyan; ctx.shadowBlur = 8; ctx.beginPath(); ctx.arc(cx, py, R, 0, 7); ctx.stroke(); ctx.fillStyle = C.cyanDim; ctx.beginPath(); ctx.arc(cx, py, 4, 0, 7); ctx.fill(); ctx.restore();
+      const e = s.x * 80, l1y = py + 120 + e, l2y = py + 120 - e;
+      line(ctx, lx, py, lx, l1y, C.cyan, 2, 6); line(ctx, rx, py, rx, l2y, C.cyan, 2, 6);
+      line(ctx, cx - R, py, lx, py, C.cyan, 2, 6); line(ctx, cx + R, py, rx, py, C.cyan, 2, 6);
+      const box = (x, y, m, label) => { const w = 16 + m * 2.2; ctx.save(); ctx.shadowColor = C.amber; ctx.shadowBlur = 12; ctx.fillStyle = "rgba(255,194,75,0.9)"; ctx.strokeStyle = C.amber; ctx.lineWidth = 2; ctx.fillRect(x - w, y, 2 * w, w * 1.4); ctx.strokeRect(x - w, y, 2 * w, w * 1.4); ctx.shadowBlur = 0; ctx.fillStyle = "#241803"; ctx.font = `bold 12px ${mono}`; ctx.textAlign = "center"; ctx.fillText(label, x, y + w * 0.9); ctx.restore(); };
+      box(lx, l1y, p.m1_kg, p.m1_kg + ""); box(rx, l2y, p.m2_kg, p.m2_kg + "");
+      const dir = s._a; if (Math.abs(dir) > 0.01) { arrow(ctx, lx + 40, l1y + 20, lx + 40, l1y + 20 + (dir > 0 ? 26 : -26), C.good); arrow(ctx, rx + 40, l2y + 20, rx + 40, l2y + 20 + (dir > 0 ? -26 : 26), C.good); } },
+    signal: (s) => ({ label: "velocity v", value: s.v || 0, unit: "m/s" }),
+    energy: null,
+    derived: (p) => { const a = (p.m1_kg - p.m2_kg) / (p.m1_kg + p.m2_kg) * p.gravity, T = 2 * p.m1_kg * p.m2_kg / (p.m1_kg + p.m2_kg) * p.gravity;
+      return [{ k: "Accel a", v: a.toFixed(2) + " m/s²" }, { k: "Tension", v: T.toFixed(1) + " N" }]; },
+    eq: <EQ><V c="a" /> = <Frac n={<>(<V c="m" /><Sub c="1" /> − <V c="m" /><Sub c="2" />)<V c="g" /></>} d={<><V c="m" /><Sub c="1" /> + <V c="m" /><Sub c="2" /></>} /></EQ>,
+  },
+
+  orbit: {
+    title: "Orbital Motion", blurb: "A body bound by inverse-square gravity.",
+    schema: [
+      { k: "radius", label: "Start radius", unit: "", min: 1, max: 3, step: 0.1, def: 1.8 },
+      { k: "speed_frac", label: "Speed (×circular)", unit: "", min: 0.5, max: 1.45, step: 0.02, def: 1.0 },
+      { k: "gravity", label: "Central mass", unit: "", min: 0.5, max: 3, step: 0.1, def: 1.4 },
+    ],
+    init: (p) => { const GM = p.gravity, R = p.radius, vc = Math.sqrt(GM / R);
+      return { x: R, y: 0, vx: 0, vy: vc * p.speed_frac, t: 0, trail: [] }; },
+    step(st, p, dt) { const GM = p.gravity; let sub = 4, h = dt / sub;
+      for (let i = 0; i < sub; i++) { const r = Math.hypot(st.x, st.y) || 1e-3, ax = -GM * st.x / r ** 3, ay = -GM * st.y / r ** 3;
+        st.vx += ax * h; st.vy += ay * h; st.x += st.vx * h; st.y += st.vy * h; } st.t += dt; },
+    draw(ctx, st, p, W, H) { const cx = W / 2, cy = H / 2, sc = Math.min(W, H) / 8;
+      const px = cx + st.x * sc, py = cy + st.y * sc;
+      st.trail.push([px, py]); if (st.trail.length > 220) st.trail.shift(); trail(ctx, st.trail, C.cyan);
+      ctx.save(); const grd = ctx.createRadialGradient(cx, cy, 2, cx, cy, 30); grd.addColorStop(0, C.amber); grd.addColorStop(1, "rgba(255,194,75,0)"); ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(cx, cy, 30, 0, 7); ctx.fill(); ctx.restore();
+      glowDot(ctx, cx, cy, 9, C.amber);
+      const vm = Math.hypot(st.vx, st.vy) || 1; arrow(ctx, px, py, px + st.vx / vm * 30, py + st.vy / vm * 30, C.magenta, "v");
+      glowDot(ctx, px, py, 8, C.cyan); },
+    signal: (st) => ({ label: "speed |v|", value: Math.hypot(st.vx, st.vy), unit: "" }),
+    energy: null,
+    derived: (p) => [{ k: "Orbit", v: p.speed_frac < 0.99 ? "elliptical (in)" : p.speed_frac > 1.01 ? (p.speed_frac > 1.41 ? "escape" : "elliptical (out)") : "circular" }, { k: "v_circular", v: Math.sqrt(p.gravity / p.radius).toFixed(2) }],
+    eq: <EQ><V c="a" /> = −<Frac n={<><V c="G" /><V c="M" /></>} d={<><V c="r" /><Sup c="2" /></>} /> <span style={{ color: C.mute, fontSize: 15, marginLeft: 8 }}>(toward the center)</span></EQ>,
+  },
+
+  bounce: {
+    title: "Bouncing Ball", blurb: "Free fall with energy lost on each impact.",
+    schema: [
+      { k: "height_m", label: "Drop height", unit: "m", min: 1, max: 20, step: 0.5, def: 10 },
+      { k: "restitution", label: "Restitution e", unit: "", min: 0.3, max: 0.95, step: 0.02, def: 0.78 },
+      { k: "gravity", label: "Gravity", unit: "m/s²", min: 1, max: 25, step: 0.1, def: 9.81 },
+    ],
+    init: (p) => ({ y: p.height_m, v: 0, t: 0, squash: 0 }),
+    step(s, p, dt) { s.v -= p.gravity * dt; s.y += s.v * dt; s.t += dt; if (s.squash > 0) s.squash = Math.max(0, s.squash - dt * 6);
+      if (s.y <= 0) { s.y = 0; if (s.v < -0.4) { s.v = -s.v * p.restitution; s.squash = 1; } else { s.v = 0; } } },
+    draw(ctx, s, p, W, H) { const gy = H - 40, sc = (gy - 40) / p.height_m, r = 15;
+      line(ctx, 0, gy, W, gy, C.cyanDim, 2, 0);
+      const py = gy - s.y * sc, sq = s.squash * 0.5;
+      ctx.save(); ctx.shadowColor = C.amber; ctx.shadowBlur = 16; ctx.fillStyle = C.amber;
+      ctx.beginPath(); ctx.ellipse(W / 2, py - r * (1 - sq), r * (1 + sq * 0.6), r * (1 - sq), 0, 0, 7); ctx.fill(); ctx.restore();
+      ctx.save(); ctx.strokeStyle = C.cyanDim; ctx.setLineDash([3, 5]); ctx.beginPath(); ctx.moveTo(W / 2 + 60, gy - p.height_m * sc); ctx.lineTo(W / 2 + 100, gy - p.height_m * sc); ctx.stroke();
+      ctx.fillStyle = C.mute; ctx.font = `11px ${mono}`; ctx.fillText(p.height_m + " m", W / 2 + 64, gy - p.height_m * sc - 6); ctx.restore(); },
+    signal: (s) => ({ label: "height y", value: Math.max(0, s.y), unit: "m" }),
+    energy: null,
+    derived: (p) => [{ k: "Energy kept", v: Math.round(p.restitution ** 2 * 100) + "% / bounce" }, { k: "e", v: p.restitution.toFixed(2) }],
+    eq: <EQ><V c="v" /><span style={{ fontSize: 14 }}>after</span> = −<V c="e" />·<V c="v" /><span style={{ fontSize: 14 }}>before</span></EQ>,
+  },
+};
+const SYS_LIST = Object.keys(SIM);
+function coerce(spec) {
+  const sys = SIM[spec?.system] ? spec.system : "pendulum";
+  const p = {}; SIM[sys].schema.forEach((f) => {
+    let v = spec?.params?.[f.k]; v = typeof v === "number" && isFinite(v) ? v : f.def; p[f.k] = clamp(v, f.min, f.max);
+  });
+  if (sys === "spring" && spec?.params?.orientation) p.orientation = spec.params.orientation;
+  return { system: sys, params: p, interpretation: spec?.interpretation || "", confidence: clamp(+spec?.confidence || 70, 0, 100), note: spec?.note || "" };
+}
+
+/* ═══════════════════════════ the lab (sim + scope) ═══════════════════════════ */
+function Lab({ system, params, running }) {
+  const stageRef = useRef(null), scopeRef = useRef(null), stateRef = useRef(null), bufRef = useRef([]), rafRef = useRef(0), sizeRef = useRef({ w: 0, h: 0 });
+  const [live, setLive] = useState({ readouts: [], energy: null });
+  const def = SIM[system];
+
+  const reinit = useCallback(() => { stateRef.current = def.init(params); bufRef.current = []; }, [system, JSON.stringify(params)]); // eslint-disable-line
+
+  useEffect(() => { reinit(); }, [reinit]);
+
+  useEffect(() => {
+    const stage = stageRef.current, scope = scopeRef.current;
+    const sctx = stage.getContext("2d"), pctx = scope.getContext("2d");
+    const fit = () => { const dpr = Math.min(devicePixelRatio, 2);
+      [stage, scope].forEach((cv) => { const r = cv.getBoundingClientRect(); cv.width = r.width * dpr; cv.height = r.height * dpr; cv.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0); });
+      sizeRef.current = { w: stage.getBoundingClientRect().width, h: stage.getBoundingClientRect().height };
+      scopeSize.current = { w: scope.getBoundingClientRect().width, h: scope.getBoundingClientRect().height }; };
+    const scopeSize = { current: { w: 0, h: 0 } };
+    fit(); const ro = new ResizeObserver(fit); ro.observe(stage); ro.observe(scope);
+
+    let last = performance.now(), acc = 0, readT = 0;
+    const loop = () => { rafRef.current = requestAnimationFrame(loop);
+      const now = performance.now(); let dt = (now - last) / 1000; last = now; dt = Math.min(dt, 0.05);
+      const { w, h } = sizeRef.current;
+      if (running && stateRef.current) { acc += dt; const fixed = 1 / 120; let n = 0;
+        while (acc >= fixed && n < 12) { def.step(stateRef.current, params, fixed); acc -= fixed; n++; }
+        const sig = def.signal(stateRef.current);
+        if (sig.label.includes("height")) stateRef.current._y = sig.value;
+        bufRef.current.push(sig.value); if (bufRef.current.length > 240) bufRef.current.shift();
+      }
+      // stage
+      bg(sctx, w, h); if (stateRef.current) def.draw(sctx, stateRef.current, params, w, h);
+      // scope
+      const sw = scopeSize.current.w, sh = scopeSize.current.h; drawScope(pctx, sw, sh, bufRef.current, def.signal(stateRef.current || def.init(params)));
+      // readouts ~10hz
+      readT += dt; if (readT > 0.1 && stateRef.current) { readT = 0;
+        const sig = def.signal(stateRef.current); const en = def.energy ? def.energy(stateRef.current, params) : null;
+        setLive({ sig, energy: en }); }
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => { cancelAnimationFrame(rafRef.current); ro.disconnect(); };
+  }, [system, JSON.stringify(params), running]); // eslint-disable-line
+
+  function drawScope(ctx, w, h, buf, sig) {
+    ctx.fillStyle = "rgba(8,12,22,1)"; ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "rgba(91,214,255,0.08)"; ctx.lineWidth = 1;
+    for (let x = 0; x < w; x += 24) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+    for (let y = 0; y < h; y += 18) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+    if (buf.length > 1) { let mn = Infinity, mx = -Infinity; for (const v of buf) { if (v < mn) mn = v; if (v > mx) mx = v; }
+      if (mx - mn < 1e-6) { mx += 1; mn -= 1; } const pad = (mx - mn) * 0.15; mn -= pad; mx += pad;
+      ctx.save(); ctx.strokeStyle = C.cyan; ctx.lineWidth = 2; ctx.shadowColor = C.cyan; ctx.shadowBlur = 8; ctx.lineJoin = "round"; ctx.beginPath();
+      buf.forEach((v, i) => { const x = (i / (buf.length - 1)) * w, y = h - ((v - mn) / (mx - mn)) * (h - 8) - 4; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke(); ctx.restore();
+      const lastV = buf[buf.length - 1], ly = h - ((lastV - mn) / (mx - mn)) * (h - 8) - 4; glowDot(ctx, w - 3, ly, 3, C.amber); }
+    ctx.fillStyle = C.mute; ctx.font = `10px ${mono}`; ctx.fillText(sig.label, 8, 14);
+  }
+
+  const energy = live.energy, total = energy ? energy.ke + energy.pe || 1 : 1;
+  return (
+    <div>
+      <div style={{ position: "relative", width: "100%", aspectRatio: "16/10", borderRadius: 16, overflow: "hidden", border: `1px solid ${C.edge}`, background: C.panel2 }}>
+        <canvas ref={stageRef} style={{ width: "100%", height: "100%", display: "block" }} />
+        <div style={{ position: "absolute", inset: 0, pointerEvents: "none", boxShadow: "inset 0 0 80px rgba(7,11,22,0.7)" }} />
+      </div>
+      <div className="lab-grid" style={{ display: "grid", gridTemplateColumns: energy ? "1fr 92px" : "1fr", gap: 12, marginTop: 12 }}>
+        <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.edge}`, height: 96 }}>
+          <canvas ref={scopeRef} style={{ width: "100%", height: "100%", display: "block" }} />
+        </div>
+        {energy && (
+          <div style={{ border: `1px solid ${C.edge}`, borderRadius: 12, padding: "8px 10px", display: "flex", gap: 8, alignItems: "flex-end", justifyContent: "center", background: C.panel2 }}>
+            {[["KE", energy.ke, C.amber], ["PE", energy.pe, C.cyan]].map(([l, val, col]) => (
+              <div key={l} style={{ textAlign: "center", flex: 1 }}>
+                <div style={{ height: 56, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+                  <div style={{ width: "70%", height: `${clamp((val / total) * 100, 1, 100)}%`, background: col, borderRadius: 3, transition: "height .12s linear", boxShadow: `0 0 8px ${col}` }} />
+                </div>
+                <div style={{ fontFamily: mono, fontSize: 9, color: C.mute, marginTop: 4 }}>{l}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════ sketch pad ═══════════════════════════ */
+const jit = (n) => (Math.random() - 0.5) * n;
+function exampleStrokes(kind) {
+  // normalized [0..1] coordinates
+  const J = 0.012;
+  if (kind === "pendulum") return [
+    [[0.32, 0.12], [0.68, 0.12]].map(([x, y]) => [x, y]),
+    Array.from({ length: 16 }, (_, i) => [0.5 + i / 15 * 0.22 + jit(J), 0.13 + i / 15 * 0.52 + jit(J)]),
+    Array.from({ length: 22 }, (_, i) => [0.72 + 0.07 * Math.cos(i / 22 * 6.28) + jit(J / 2), 0.65 + 0.07 * Math.sin(i / 22 * 6.28) + jit(J / 2)]),
+  ];
+  if (kind === "incline") return [
+    [[0.15, 0.78], [0.85, 0.78]],
+    [[0.15, 0.78], [0.15, 0.34]],
+    [[0.15, 0.34], [0.85, 0.78]],
+    Array.from({ length: 5 }, (_, i) => [0.36 + (i % 2) * 0.1, 0.56 + Math.floor(i / 2) * 0.1]).concat([[0.36, 0.56]]),
+  ];
+  if (kind === "projectile") return [
+    [[0.08, 0.82], [0.92, 0.82]],
+    [[0.12, 0.82], [0.2, 0.7]],
+    Array.from({ length: 26 }, (_, i) => { const t = i / 25; return [0.16 + t * 0.7, 0.78 - Math.sin(t * Math.PI) * 0.5 + jit(J)]; }),
+  ];
+  if (kind === "double") return [
+    [[0.34, 0.14], [0.66, 0.14]],
+    Array.from({ length: 12 }, (_, i) => [0.5 + i / 11 * 0.16 + jit(J), 0.15 + i / 11 * 0.34 + jit(J)]),
+    Array.from({ length: 12 }, (_, i) => [0.66 - i / 11 * 0.04 + jit(J), 0.49 + i / 11 * 0.32 + jit(J)]),
+    Array.from({ length: 18 }, (_, i) => [0.66 + 0.05 * Math.cos(i / 18 * 6.28), 0.49 + 0.05 * Math.sin(i / 18 * 6.28)]),
+    Array.from({ length: 18 }, (_, i) => [0.62 + 0.05 * Math.cos(i / 18 * 6.28), 0.81 + 0.05 * Math.sin(i / 18 * 6.28)]),
+  ];
+  if (kind === "spring") return [
+    [[0.34, 0.12], [0.66, 0.12]],
+    Array.from({ length: 24 }, (_, i) => [0.5 + (i % 2 ? 0.07 : -0.07) * (i > 1 && i < 22 ? 1 : 0), 0.13 + i / 24 * 0.42]),
+    [[0.42, 0.6], [0.58, 0.6], [0.58, 0.76], [0.42, 0.76], [0.42, 0.6]],
+  ];
+  return [];
+}
+function SketchPad({ strokesRef, onChange, flash }) {
+  const cv = useRef(null), drawing = useRef(false);
+  const redraw = useCallback(() => { const c = cv.current; if (!c) return; const ctx = c.getContext("2d");
+    const r = c.getBoundingClientRect(), dpr = Math.min(devicePixelRatio, 2); c.width = r.width * dpr; c.height = r.height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = r.width, H = r.height; bg(ctx, W, H);
+    ctx.save(); ctx.strokeStyle = C.cyan; ctx.lineWidth = 2.6; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.shadowColor = C.cyan; ctx.shadowBlur = 7;
+    strokesRef.current.forEach((st) => { if (st.length < 1) return; ctx.beginPath(); st.forEach(([x, y], i) => { i ? ctx.lineTo(x * W, y * H) : ctx.moveTo(x * W, y * H); }); ctx.stroke(); });
+    ctx.restore(); }, [strokesRef]);
+
+  useEffect(() => { redraw(); const ro = new ResizeObserver(redraw); ro.observe(cv.current); return () => ro.disconnect(); }, [redraw]);
+  useEffect(() => { redraw(); }, [flash, redraw]);
+
+  const pos = (e) => { const r = cv.current.getBoundingClientRect(); const t = e.touches ? e.touches[0] : e; return [clamp((t.clientX - r.left) / r.width, 0, 1), clamp((t.clientY - r.top) / r.height, 0, 1)]; };
+  const down = (e) => { drawing.current = true; strokesRef.current.push([pos(e)]); redraw(); if (e.cancelable) e.preventDefault(); };
+  const move = (e) => { if (!drawing.current) return; const cur = strokesRef.current[strokesRef.current.length - 1]; const p = pos(e); const last = cur[cur.length - 1]; if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) > 0.004) { cur.push(p); redraw(); } if (e.cancelable) e.preventDefault(); };
+  const up = () => { if (drawing.current) { drawing.current = false; onChange(); } };
+
+  return <canvas ref={cv} onMouseDown={down} onMouseMove={move} onMouseUp={up} onMouseLeave={up}
+    onTouchStart={down} onTouchMove={move} onTouchEnd={up}
+    style={{ width: "100%", height: "100%", display: "block", cursor: "crosshair", touchAction: "none" }} />;
+}
+function strokesToImage(strokes) {
+  const W = 640, H = 400, c = document.createElement("canvas"); c.width = W; c.height = H; const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H); ctx.strokeStyle = "#111"; ctx.lineWidth = 3.2; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  strokes.forEach((st) => { if (st.length < 1) return; ctx.beginPath(); st.forEach(([x, y], i) => { i ? ctx.lineTo(x * W, y * H) : ctx.moveTo(x * W, y * H); }); ctx.stroke(); });
+  return c.toDataURL("image/png").split(",")[1];
+}
+
+/* ═══════════════════════════ AI call ═══════════════════════════ */
+async function interpret(b64) {
+  const res = await fetch("/api/interpret", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: b64 }) });
+  if (!res.ok) throw new Error("net");
+  const j = await res.json();
+  if (j && j.error === "no_key") return coerce({ system: "pendulum", interpretation: "Sketch-reading is offline \u2014 add your Anthropic key to switch it on, or just pick a system from the dropdown. Every simulation below works without it.", confidence: 0, params: {} });
+  if (!j || !j.system) throw new Error("bad");
+  return coerce(j);
+}
+
+/* ═══════════════════════════ app ═══════════════════════════ */
+function App() {
+  const strokesRef = useRef([]);
+  const [flash, setFlash] = useState(0);
+  const [phase, setPhase] = useState("draw"); // draw | thinking | result
+  const [spec, setSpec] = useState(null);
+  const [params, setParams] = useState(null);
+  const [err, setErr] = useState("");
+  const [running, setRunning] = useState(true);
+  const [materialize, setMat] = useState(false);
+
+  const redrawFlash = () => setFlash((f) => f + 1);
+  const loadExample = (k) => { strokesRef.current = exampleStrokes(k); redrawFlash(); setErr(""); };
+  const clear = () => { strokesRef.current = []; redrawFlash(); };
+  const undo = () => { strokesRef.current.pop(); redrawFlash(); };
+
+  async function run() {
+    if (!strokesRef.current.length) { setErr("Draw something first — or load an example below."); return; }
+    setErr(""); setPhase("thinking");
+    try { const b64 = strokesToImage(strokesRef.current); const sp = await interpret(b64);
+      setSpec(sp); setParams(sp.params); setPhase("result"); setMat(true); setRunning(true); setTimeout(() => setMat(false), 1100);
+    } catch (e) { setErr("Couldn't read that sketch. Try again, or load an example."); setPhase("draw"); }
+  }
+
+  const setP = (k, v) => setParams((p) => ({ ...p, [k]: v }));
+  const overrideSys = (sys) => { const d = {}; SIM[sys].schema.forEach((f) => (d[f.k] = f.def)); setSpec((s) => ({ ...s, system: sys, interpretation: "Manually set to " + SIM[sys].title.toLowerCase() + ".", confidence: 100 })); setParams(d); setMat(true); setTimeout(() => setMat(false), 900); };
+
+  const def = spec ? SIM[spec.system] : null;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.ink, color: C.paper, fontFamily: ui }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@1,6..72,400;1,6..72,500&display=swap');
+        *{box-sizing:border-box}body{margin:0}
+        .spin{animation:sp 1s linear infinite;display:inline-flex}@keyframes sp{to{transform:rotate(360deg)}}
+        .mat{animation:mat 1.1s ease both}@keyframes mat{0%{opacity:0;filter:blur(6px) brightness(2)}40%{opacity:1}100%{filter:none}}
+        .rise{animation:rise .5s cubic-bezier(.2,.8,.25,1) both}@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1}}
+        input[type=range]{-webkit-appearance:none;width:100%;height:3px;background:${C.edge};border-radius:3px;outline:none}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:${C.cyan};cursor:pointer;box-shadow:0 0 8px ${C.cyan}}
+        input[type=range]::-moz-range-thumb{width:15px;height:15px;border:none;border-radius:50%;background:${C.cyan};cursor:pointer}
+        select{-webkit-appearance:none;appearance:none}
+        button:focus-visible{outline:2px solid ${C.amber};outline-offset:2px}
+        ::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:${C.edge};border-radius:8px}
+        @media(max-width:760px){.cols2{grid-template-columns:1fr!important}}
+        @media(prefers-reduced-motion:reduce){.mat,.rise{animation:none}}`}</style>
+
+      <div style={{ position: "fixed", inset: 0, pointerEvents: "none", background: `radial-gradient(1100px 520px at 15% -10%, rgba(91,214,255,0.07), transparent), radial-gradient(900px 460px at 95% 0%, rgba(255,194,75,0.05), transparent)` }} />
+
+      <div style={{ position: "relative", maxWidth: 1080, margin: "0 auto", padding: "0 18px 64px" }}>
+        <header style={{ paddingTop: 36, paddingBottom: 22, textAlign: "center" }}>
+          <div style={{ fontFamily: mono, fontSize: 10.5, letterSpacing: 2, textTransform: "uppercase", color: C.cyan }}>Sketch → Simulation</div>
+          <h1 style={{ fontFamily: disp, fontWeight: 700, fontSize: "clamp(38px,8vw,66px)", margin: "10px 0 0", letterSpacing: -1, lineHeight: 0.98 }}>
+            Re<span style={{ color: C.cyan }}>flow</span>
+          </h1>
+          <p style={{ color: C.mute, maxWidth: 540, margin: "14px auto 0", fontSize: 15.5, lineHeight: 1.55 }}>
+            Draw a physical system the way you'd scribble it on paper. An AI reads your sketch, brings it to life as a <span style={{ color: C.paper }}>real, running simulation</span>, and hands you the equations — then let you bend the physics live.
+          </p>
+        </header>
+
+        <div className="cols2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, alignItems: "start" }}>
+          {/* LEFT: sketch */}
+          <div className="rise">
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <span style={{ fontFamily: mono, fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase", color: C.mute }}>① Sketchpad</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={undo} style={chip}>Undo</button>
+                <button onClick={clear} style={chip}>Clear</button>
+              </div>
+            </div>
+            <div style={{ position: "relative", width: "100%", aspectRatio: "16/10", borderRadius: 16, overflow: "hidden", border: `1px solid ${C.edge}` }}>
+              <SketchPad strokesRef={strokesRef} onChange={() => { }} flash={flash} />
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginTop: 12 }}>
+              <span style={{ fontFamily: mono, fontSize: 10.5, color: C.mute, alignSelf: "center", marginRight: 2 }}>try:</span>
+              {[["pendulum", "Pendulum"], ["incline", "Ramp"], ["projectile", "Projectile"], ["double", "Double pend."], ["spring", "Spring"]].map(([k, l]) => (
+                <button key={k} onClick={() => loadExample(k)} style={{ ...chip, borderStyle: "dashed", color: C.cyan, borderColor: C.cyanDim }}>{l}</button>
+              ))}
+            </div>
+            <button onClick={run} disabled={phase === "thinking"}
+              style={{ width: "100%", marginTop: 14, background: phase === "thinking" ? C.panel : `linear-gradient(180deg, ${C.amber}, #e8a92f)`, color: phase === "thinking" ? C.mute : "#231803", border: "none", borderRadius: 13, padding: "15px", fontFamily: disp, fontWeight: 700, fontSize: 16, cursor: phase === "thinking" ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, boxShadow: phase === "thinking" ? "none" : `0 8px 30px -10px ${C.amber}` }}>
+              {phase === "thinking" ? <><span className="spin"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.6" /></svg></span>Reading your drawing…</> : <>Bring it to life →</>}
+            </button>
+            {err && <p style={{ color: C.bad, fontFamily: mono, fontSize: 12.5, marginTop: 10, textAlign: "center" }}>{err}</p>}
+          </div>
+
+          {/* RIGHT: result */}
+          <div className="rise" style={{ minHeight: 320 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <span style={{ fontFamily: mono, fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase", color: C.mute }}>② Live simulation</span>
+              {spec && (
+                <select value={spec.system} onChange={(e) => overrideSys(e.target.value)}
+                  style={{ background: C.panel, color: C.paper, border: `1px solid ${C.edge}`, borderRadius: 8, padding: "5px 9px", fontFamily: mono, fontSize: 11, cursor: "pointer" }}>
+                  {SYS_LIST.map((s) => <option key={s} value={s}>{SIM[s].title}</option>)}
+                </select>
+              )}
+            </div>
+
+            {phase !== "result" && (
+              <div style={{ width: "100%", aspectRatio: "16/10", borderRadius: 16, border: `1px dashed ${C.edge}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: C.mute, textAlign: "center", padding: 20 }}>
+                {phase === "thinking" ? <><span className="spin"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke={C.cyan} strokeWidth="2.5" strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.6" /></svg></span><span style={{ fontFamily: mono, fontSize: 12.5 }}>interpreting the sketch…</span></>
+                  : <><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke={C.cyanDim} strokeWidth="1.5"><path d="m8 3 4 8 5-5 5 15H2L8 3z" /></svg><span style={{ fontSize: 13.5, maxWidth: 240 }}>Your simulation will materialize here once the AI reads your drawing.</span></>}
+              </div>
+            )}
+
+            {phase === "result" && spec && (
+              <div className={materialize ? "mat" : ""}>
+                <Lab system={spec.system} params={params} running={running} />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* interpretation + equation + controls */}
+        {phase === "result" && spec && (
+          <div className="rise" style={{ marginTop: 22 }}>
+            <div style={{ background: `linear-gradient(180deg, rgba(91,214,255,0.06), transparent)`, border: `1px solid ${C.edge}`, borderRadius: 18, padding: 22 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 14, flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: disp, fontWeight: 700, fontSize: 19, color: C.cyan }}>{def.title}</span>
+                    <span style={{ fontFamily: mono, fontSize: 10.5, color: C.mute, border: `1px solid ${C.edge}`, borderRadius: 99, padding: "2px 8px" }}>read with {spec.confidence}% confidence</span>
+                  </div>
+                  <p style={{ color: C.paper, fontSize: 15, lineHeight: 1.55, margin: "10px 0 0", fontStyle: "italic", fontFamily: mathF }}>“{spec.interpretation}”</p>
+                  <p style={{ color: C.mute, fontSize: 13, margin: "8px 0 0" }}>{def.blurb}{spec.note ? " — " + spec.note : ""}</p>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => setRunning((r) => !r)} style={{ ...ctrlBtn, color: C.cyan, borderColor: C.cyanDim }}>{running ? "❚❚ Pause" : "▶ Play"}</button>
+                  <button onClick={() => setParams({ ...params })} style={ctrlBtn}>↻ Reset</button>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 18, padding: "16px 18px", background: C.panel2, border: `1px solid ${C.edge}`, borderRadius: 13, overflowX: "auto" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: 1.5, textTransform: "uppercase", color: C.mute, marginBottom: 8 }}>Governing equation</div>
+                {def.eq}
+                <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginTop: 12 }}>
+                  {def.derived(params).map((d) => (
+                    <div key={d.k} style={{ fontFamily: mono, fontSize: 12 }}><span style={{ color: C.mute }}>{d.k} </span><span style={{ color: C.amber }}>{d.v}</span></div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 18 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: 1.5, textTransform: "uppercase", color: C.mute, marginBottom: 12 }}>Tune the physics</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: "16px 22px" }}>
+                  {def.schema.map((f) => (
+                    <div key={f.k}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                        <span style={{ fontFamily: ui, fontSize: 12.5, color: C.paper }}>{f.label}</span>
+                        <span style={{ fontFamily: mono, fontSize: 12, color: C.amber }}>{(+params[f.k]).toFixed(f.step < 1 ? 2 : 0)}{f.unit && " " + f.unit}</span>
+                      </div>
+                      <input type="range" min={f.min} max={f.max} step={f.step} value={params[f.k]} onChange={(e) => setP(f.k, +e.target.value)} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <footer style={{ marginTop: 30, textAlign: "center", color: C.mute, fontFamily: mono, fontSize: 10.5, lineHeight: 1.7 }}>
+          Vision + physics interpretation by Claude · simulations run on real numerical integration (RK4 / Verlet), in your browser.<br />Built as a demonstration — idealized models, not engineering-grade analysis.
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+const chip = { background: "transparent", color: C.mute, border: `1px solid ${C.edge}`, borderRadius: 99, padding: "5px 11px", fontFamily: mono, fontSize: 11, cursor: "pointer" };
+const ctrlBtn = { background: C.panel, color: C.paper, border: `1px solid ${C.edge}`, borderRadius: 10, padding: "8px 13px", fontFamily: mono, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" };
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
